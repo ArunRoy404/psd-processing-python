@@ -104,7 +104,11 @@ class PsdWarpApp:
         total_layers = len(layers_data)
 
         for idx, layer_data in enumerate(layers_data):
+            if layer_data.get('hidden', False):
+                continue
+
             name = layer_data.get('name', 'Unknown')
+            opacity = layer_data.get('opacity', 1.0)
             
             # Update Progress UI
             percent = ((idx) / total_layers) * 100
@@ -116,14 +120,20 @@ class PsdWarpApp:
             if 'placedLayer' in layer_data:
                 warped_arr = self.run_warp_math(canvas_w, canvas_h, layer_data)
                 warped_pil = Image.fromarray(warped_arr)
+                if opacity < 1.0:
+                    warped_pil = self.apply_opacity(warped_pil, opacity)
                 final_image.alpha_composite(warped_pil)
             
             # 2. Standard Layer
             else:
                 psd_layer_img = self.get_psd_layer_by_name(name)
                 if psd_layer_img:
+                    if opacity < 1.0:
+                        psd_layer_img = self.apply_opacity(psd_layer_img, opacity)
                     layer_canvas = Image.new("RGBA", (canvas_w, canvas_h), (0,0,0,0))
-                    layer_canvas.paste(psd_layer_img, (layer_data['left'], layer_data['top']))
+                    # Use the image itself as a mask if it has an alpha channel to ensure correct transparency
+                    mask = psd_layer_img if psd_layer_img.mode == 'RGBA' else None
+                    layer_canvas.paste(psd_layer_img, (layer_data['left'], layer_data['top']), mask)
                     final_image.alpha_composite(layer_canvas)
 
         # Final Wrap up
@@ -192,8 +202,20 @@ class PsdWarpApp:
         final_warp = cv2.merge([b, g, r, a])
 
         return final_warp
-    
-    
+    def apply_opacity(self, pil_img, opacity):
+        """Applies opacity (0.0 to 1.0) to a PIL image."""
+        if opacity >= 1.0:
+            return pil_img
+        
+        if pil_img.mode != 'RGBA':
+            pil_img = pil_img.convert('RGBA')
+            
+        r, g, b, a = pil_img.split()
+        # Use a lookup table for faster calculation
+        lut = [int(i * opacity) for i in range(256)]
+        a = a.point(lut)
+        return Image.merge("RGBA", (r, g, b, a))
+
     def update_preview(self, pil_img):
         img_w, img_h = pil_img.size
         ratio = min(800/img_w, 450/img_h)
