@@ -59,8 +59,24 @@ class PsdWarpApp:
         path = filedialog.askopenfilename(filetypes=[("PSD", "*.psd *.psb")])
         if path:
             self.psd_obj = PSDImage.open(path)
+            # Hide all smart objects in the PSD to avoid showing placeholder colors
+            self.hide_smart_objects(self.psd_obj)
             self.status_labels["PSD File:"].config(text="Loaded", fg="green")
             self.update_preview(self.psd_obj.composite())
+
+    def hide_smart_objects(self, container):
+        """Recursively hide layers that are Smart Objects."""
+        for layer in container:
+            # Hide if it's a smart object
+            if hasattr(layer, 'kind') and layer.kind == 'smartobject':
+                layer.visible = False
+            # Recurse into groups
+            if hasattr(layer, '__iter__') and not hasattr(layer, 'kind'): # Groups don't have kind usually, or kind is 'group'
+                self.hide_smart_objects(layer)
+            elif hasattr(layer, 'is_group') and layer.is_group():
+                self.hide_smart_objects(layer)
+            elif hasattr(layer, 'kind') and layer.kind == 'group':
+                self.hide_smart_objects(layer)
 
     def load_json(self):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
@@ -118,7 +134,10 @@ class PsdWarpApp:
         while idx < total_layers:
             layer_data = layers_data[idx]
             if layer_data.get('hidden', False):
+                # Skip this layer AND any clipped layers attached to it
                 idx += 1
+                while idx < total_layers and layers_data[idx].get('clipping', False):
+                    idx += 1
                 continue
 
             # 1. Update Progress
@@ -129,8 +148,9 @@ class PsdWarpApp:
             self.root.update_idletasks()
 
             # 2. Render this layer as a potential clipping base
+            blend_mode = layer_data.get('blendMode', 'normal')
             base_img = self.render_layer(layer_data, canvas_w, canvas_h)
-            final_image.alpha_composite(base_img)
+            final_image = self.apply_blend_mode(final_image, base_img, blend_mode)
 
             # 3. Handle any consecutive layers clipped to this one
             next_idx = idx + 1
@@ -139,6 +159,7 @@ class PsdWarpApp:
                 
                 # Update Progress for clipped layer too
                 c_name = clipped_layer_data.get('name', 'Unknown')
+                c_blend = clipped_layer_data.get('blendMode', 'normal')
                 c_percent = (next_idx / total_layers) * 100
                 self.progress_var.set(c_percent)
                 self.progress_label.config(text=f"Processing clipped layer {next_idx+1}/{total_layers}: {c_name}")
@@ -148,15 +169,14 @@ class PsdWarpApp:
                     # Render the clipped layer
                     clipped_img = self.render_layer(clipped_layer_data, canvas_w, canvas_h)
                     
-                    # Apply the base layer's alpha mask
+                    # Apply the base layer's alpha mask (stencil effect)
                     base_alpha = base_img.getchannel('A')
                     r, g, b, a = clipped_img.split()
-                    
-                    # Multiply clipped alpha by base alpha (stencil effect)
                     new_a = ImageChops.multiply(a, base_alpha)
-                    
                     masked_clipped_img = Image.merge("RGBA", (r, g, b, new_a))
-                    final_image.alpha_composite(masked_clipped_img)
+                    
+                    # Apply blend mode for clipped layer
+                    final_image = self.apply_blend_mode(final_image, masked_clipped_img, c_blend)
                 
                 next_idx += 1
             
@@ -177,25 +197,73 @@ class PsdWarpApp:
         # 1. Warp/Smart Object Layer
         if 'placedLayer' in layer_data:
             warped_arr = self.run_warp_math(canvas_w, canvas_h, layer_data)
-            warped_pil = Image.fromarray(warped_arr)
-            if opacity < 1.0:
-                warped_pil = self.apply_opacity(warped_pil, opacity)
-            return warped_pil
+            layer_img = Image.fromarray(warped_arr)
         
         # 2. Standard Layer
         else:
             psd_layer_img = self.get_psd_layer_by_name(name)
             if psd_layer_img:
-                if opacity < 1.0:
-                    psd_layer_img = self.apply_opacity(psd_layer_img, opacity)
-                
-                layer_canvas = Image.new("RGBA", (canvas_w, canvas_h), (0,0,0,0))
-                # Use the image itself as a mask if it has an alpha channel
+                layer_img = Image.new("RGBA", (canvas_w, canvas_h), (0,0,0,0))
                 mask = psd_layer_img if psd_layer_img.mode == 'RGBA' else None
-                layer_canvas.paste(psd_layer_img, (layer_data['left'], layer_data['top']), mask)
-                return layer_canvas
-                
-        return Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+                layer_img.paste(psd_layer_img, (layer_data['left'], layer_data['top']), mask)
+            else:
+                layer_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+        # Apply Mask if present in JSON
+        if 'mask' in layer_data and not layer_data['mask'].get('disabled', False):
+            m = layer_data['mask']
+            # Create a simple rectangular mask from bounds
+            mask_box = Image.new("L", (canvas_w, canvas_h), 0)
+            # The mask bounds in JSON are absolute canvas coordinates
+            l, t, r, b = m['left'], m['top'], m['right'], m['bottom']
+            mask_box.paste(255, (l, t, r, b))
+            
+            # Combine with existing alpha
+            r, g, b, a = layer_img.split()
+            new_a = ImageChops.multiply(a, mask_box)
+            layer_img = Image.merge("RGBA", (r, g, b, new_a))
+
+        # Apply Opacity
+        if opacity < 1.0:
+            layer_img = self.apply_opacity(layer_img, opacity)
+            
+        return layer_img
+
+    def apply_blend_mode(self, background, foreground, mode):
+        """Applies Photoshop-style blend modes using numpy for performance."""
+        if mode == 'normal' or mode not in ['multiply', 'linear burn']:
+            background.alpha_composite(foreground)
+            return background
+
+        # Convert to numpy arrays for channel-wise math
+        # background and foreground are PIL RGBA images
+        back = np.array(background).astype(np.float32)
+        front = np.array(foreground).astype(np.float32)
+
+        # Normalize alpha to 0-1
+        alpha_f = front[:, :, 3:4] / 255.0
+        
+        # Separate channels
+        rgb_b = back[:, :, :3]
+        rgb_f = front[:, :, :3]
+
+        if mode == 'multiply':
+            blend_rgb = (rgb_f * rgb_b) / 255.0
+        elif mode == 'linear burn':
+            blend_rgb = np.clip(rgb_f + rgb_b - 255.0, 0, 255)
+        else:
+            blend_rgb = rgb_f # Should not happen
+
+        # Alpha Compositing Formula: 
+        # Result = Front_Alpha * Blended_Color + (1 - Front_Alpha) * Back_Color
+        res_rgb = (alpha_f * blend_rgb) + ((1 - alpha_f) * rgb_b)
+        
+        # Final Alpha: standard alpha composite formula
+        alpha_b = back[:, :, 3:4] / 255.0
+        res_alpha = (alpha_f + alpha_b * (1 - alpha_f)) * 255.0
+
+        res_arr = np.concatenate([res_rgb, res_alpha], axis=2).astype(np.uint8)
+        return Image.fromarray(res_arr)
 
     def run_warp_math(self, canvas_w, canvas_h, layer_data):
         scale = 2
@@ -284,10 +352,10 @@ class PsdWarpApp:
         final_warp = cv2.resize(warped_high_res, (canvas_w, canvas_h), interpolation=cv2.INTER_AREA)
 
         # 7. Final Polish: Soften the alpha edges slightly to blend with the PSD
-        # This removes the "cut-out" look
-        b, g, r, a = cv2.split(final_warp)
+        # This removes the "cut-out" look. Channel order is RGBA from self.user_img
+        r, g, b, a = cv2.split(final_warp)
         a = cv2.GaussianBlur(a, (3, 3), 0)
-        final_warp = cv2.merge([b, g, r, a])
+        final_warp = cv2.merge([r, g, b, a])
 
         return final_warp
     def apply_opacity(self, pil_img, opacity):
